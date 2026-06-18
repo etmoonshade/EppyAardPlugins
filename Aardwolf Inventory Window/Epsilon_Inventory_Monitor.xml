@@ -1,0 +1,1376 @@
+<?xml version="1.0" encoding="iso-8859-1"?>
+<!DOCTYPE muclient>
+
+<!-- ===================================================================
+   Epsilon_Inventory_Monitor  (in-game command: emon)
+   Live inventory display for Aardwolf (MUSHclient)
+
+   Display-only inventory window + optional per-container monitor windows.
+
+   MODEL (v0.4): event-driven / incremental. We do NOT issue a command on
+   every inventory change (that adds MUD input lag, which matters in combat).
+   Instead we maintain item state from the pushed invmon/invitem stream and
+   only run invdata/eqdata for a baseline / resync.
+
+     state:   items[id] = { id, flags, name, plain, level, itype, ..., loc }
+              loc = "inv" | "worn" | <container objectid>   (only "inv" + monitored
+              containers are displayed; "worn" is cached so gear swaps don't pull)
+     baseline (commands, rare): in-game entry (login welcome line, or a reload
+              while already playing) / `emon refresh` / adding a monitor
+              -> invdata (carried) + eqdata (worn) + invdata <id> (a container)
+              never at the login screen; every pull is gated on in_game()
+     live (no commands):
+              {invitem}id,flags,name,...   -> full data for a genuine add
+              {invmon}action,oid,cid,wear  -> move/remove an id between locs
+     reconcile: an event for an item we STILL have no data for (e.g. grabbed from
+              an un-baselined container) schedules ONE debounced background pull.
+              Rare; never on the combat path.
+
+   See protocol-notes.md in this folder for the tag formats and gotchas.
+======================================================================== -->
+
+<muclient>
+<plugin
+   name="Epsilon_Inventory_Monitor"
+   author="Epsilon"
+   id="e9b17f3c5a2d4068b1c7f0a4"
+   language="Lua"
+   purpose="Live inventory display window for Aardwolf"
+   date_written="2026-06-17 00:00:00"
+   requires="5.07"
+   version="0.12"
+   save_state="y"
+   sequence="100"
+>
+</plugin>
+
+<!-- ================================ aliases ============================ -->
+<aliases>
+  <alias
+     match="^emon(?:\s+(.*))?$"
+     regexp="y"
+     enabled="y"
+     ignore_case="y"
+     sequence="100"
+     send_to="12"
+     script="emon_command"
+  ></alias>
+</aliases>
+
+<!-- ================================ triggers =========================== -->
+<triggers>
+  <!-- live "something changed" events -->
+  <trigger
+     match="^\{invmon\}(.*)$"
+     regexp="y"
+     enabled="y"
+     keep_evaluating="y"
+     omit_from_output="y"
+     omit_from_log="y"
+     sequence="50"
+     send_to="12"
+     script="emon_on_invmon"
+  ></trigger>
+
+  <!-- full item data on a genuine "added to your character" event -->
+  <trigger
+     match="^\{invitem\}(.*)$"
+     regexp="y"
+     enabled="y"
+     keep_evaluating="y"
+     omit_from_output="y"
+     omit_from_log="y"
+     sequence="50"
+     send_to="12"
+     script="emon_on_invitem"
+  ></trigger>
+
+  <!-- in-game signal: the final login "Welcome to Aardwolf" line. Specific
+       enough that player chatter ("Welcome to Aardwolf, Bob") won't match; left
+       enabled so a relog re-baselines. Baseline must NOT run before this (a fresh
+       connect fires OnPluginConnect at the login screen). -->
+  <trigger
+     name="emon_ingame"
+     match="^Welcome to Aardwolf\. May your adventures be mystical"
+     regexp="y"
+     enabled="y"
+     keep_evaluating="y"
+     sequence="100"
+     send_to="12"
+     script="emon_on_ingame"
+  ></trigger>
+
+  <!-- batch capture (see emon_batch): all four are armed only during a baseline
+       batch. start notes the scope and arms body; body accumulates a block's
+       lines; end parses the block; sentinel restores config and ends the batch.
+       Tag and block lines are omitted; anything else (e.g. a channel line) hits no
+       armed trigger and passes through. start/end/sentinel are higher priority
+       (seq 50) than body (seq 100) so they catch their tags instead of body
+       swallowing them. -->
+  <trigger name="emon_cap_start"
+     match="^\{(invdata|eqdata|keyring|vault)( \d+)?\}$"
+     regexp="y" enabled="n" omit_from_output="y" omit_from_log="y"
+     sequence="50" send_to="12" script="Emon_cap_start"></trigger>
+  <trigger name="emon_cap_end"
+     match="^\{/(invdata|eqdata|keyring|vault)\}$"
+     regexp="y" enabled="n" omit_from_output="y" omit_from_log="y"
+     sequence="50" send_to="12" script="Emon_cap_end"></trigger>
+  <trigger name="emon_cap_sentinel"
+     match="^\{emon-done\}$"
+     regexp="y" enabled="n" omit_from_output="y" omit_from_log="y"
+     sequence="50" send_to="12" script="Emon_cap_sentinel"></trigger>
+  <trigger name="emon_cap_body"
+     match="^.*$"
+     regexp="y" enabled="n" omit_from_output="y" omit_from_log="y"
+     sequence="100" send_to="12" script="Emon_cap_body"></trigger>
+</triggers>
+
+<!-- ================================ script ============================= -->
+<script>
+<![CDATA[
+require "aardwolf_colors"      -- StylesToColours / strip_colours / ColoursToANSI (xterm-aware)
+require "themed_miniwindows"   -- ThemedTextWindow
+require "gmcphelper"           -- gmcp()
+
+-- --------------------------------------------------------------------- --
+-- constants
+-- --------------------------------------------------------------------- --
+local TYPE_CONTAINER = 11
+
+-- one CSV line of invdata/invitem output (name field may contain commas/colour
+-- codes; the 5 trailing numeric fields anchor the match)
+local invrex = rex.new("^(\\d+),(\\w*),(.+),(\\d+),(\\d+),([01]),(-?\\d+),(-?\\d+)")
+
+local TYPE_NAME = {
+   [1]="Light",[2]="Scroll",[3]="Wand",[4]="Stave",[5]="Weapon",[6]="Treasure",
+   [7]="Armor",[8]="Potion",[9]="Furniture",[10]="Trash",[11]="Container",
+   [12]="Drink",[13]="Key",[14]="Food",[15]="Boat",[16]="Mob Corpse",
+   [17]="Player Corpse",[18]="Fountain",[19]="Pill",[20]="Portal",[21]="Beacon",
+   [22]="Gift Card",[23]="Unused",[24]="Raw Material",[25]="Campfire",
+   [26]="Forge",[27]="Runestone",
+}
+
+-- flags letter -> display info (from the 'object auras' help). N (Nolocate) is
+-- letter -> display info, from the in-game object-flags help (the @ colour on
+-- each entry there IS the inventory colour). N (Nolocate) is in the invdata flags
+-- field but the inventory omits it, so it's skipped. Blue Aura's short code is
+-- cyan in the help (to set it apart from Magic's blue), hence its short_colour.
+local FLAG_INFO = {
+   K = { short = "(K)", long = "(K)",          colour = "@R" },
+   M = { short = "(M)", long = "(Magic)",      colour = "@B" },
+   G = { short = "(G)", long = "(Glow)",       colour = "@W" },
+   H = { short = "(H)", long = "(Hum)",        colour = "@C" },
+   I = { short = "(I)", long = "(Invis)",      colour = "@w" },
+   C = { short = "(C)", long = "(Cursed)",     colour = "@D" },
+   E = { short = "(E)", long = "(Envenomed)",  colour = "@G" },
+   T = { short = "(T)", long = "(Tempered)",   colour = "@R" },
+   B = { short = "(B)", long = "(Blue Aura)",  colour = "@B", short_colour = "@c" },
+   R = { short = "(R)", long = "(Red Aura)",   colour = "@R" },
+}
+local FLAG_SKIP  = { N = true }
+local SEPARATOR  = "@x242" .. string.rep("-", 120)
+
+-- fixed-location ("scope") windows beyond the main inventory, toggled by
+-- `emon keyring` / `emon vault`. Same line format as invdata; different command
+-- and tags. `var` is the persisted visibility flag.
+local SCOPES = {
+   keyring = { loc = "keyring", title = "Keyring", cmd = "keyring data",
+               var = "keyring_visible", x = 80, y = 120, always_open = true },
+   vault   = { loc = "vault",   title = "Vault",   cmd = "vault data",
+               var = "vault_visible",   x = 80, y = 500 },
+}
+local SCOPE_ORDER = { "keyring", "vault" }
+
+-- --------------------------------------------------------------------- --
+-- state
+-- --------------------------------------------------------------------- --
+local items       = {}      -- id -> record (with .loc and .seq)
+local seq_counter = 0       -- assigns a stable display order (approx inventory order)
+local main_window           -- ThemedTextWindow or nil
+local monitors    = {}      -- key = lowercased container term -> monitor table
+
+local reconcile_pending   = false
+local suppress_close_hook = false   -- true while WE delete a window (vs. user clicking [X])
+local entered             = false   -- our own reliable "in-game" flag (GMCP can be stale)
+local golive_pending      = false
+local cap                 = nil     -- the active capture batch ({loc,lines,on_done,...}) or nil
+local batch_queue         = {}      -- batches waiting for the current one to finish
+local batch_gen           = 0       -- generation counter for the batch timeout safety
+local scope_win           = {}      -- loc ("keyring"/"vault") -> ThemedTextWindow
+
+-- persisted display settings
+local show_flags      = (GetVariable("show_flags") == "1")           -- default off
+local use_short_flags = (GetVariable("short_flags") or "1") == "1"   -- default short
+local sort_mode       = GetVariable("sort_mode") or "inv"            -- "inv" | "type"
+-- expiry-timer colour thresholds, in hours: < red -> red, > yellow -> green,
+-- anything in between -> yellow. Defaults 24h (1 day) / 168h (7 days).
+local timer_red_h     = tonumber(GetVariable("timer_red_h"))    or 24
+local timer_yellow_h  = tonumber(GetVariable("timer_yellow_h")) or 168
+-- for a stack of timed items, show the "soonest" (next to drop) or "latest"
+-- (when you run out) member's expiry. Tick = expiry-countdown redraw period (s).
+local stack_timer_mode = GetVariable("stack_timer") or "soonest"     -- "soonest" | "latest"
+local timer_tick_secs  = tonumber(GetVariable("timer_tick_secs")) or 1
+
+-- forward declarations
+local make_record, parse_invdata, store_item, remove_item, relocate, collect
+local is_monitored_cid, aggregate, sort_stacks, matches_any
+local format_count, format_flags, format_level, format_row, render_stacks
+local make_window, quiet_delete, ensure_main_window, find_container
+local render_main, render_window_loc, render_monitor, render_monitor_missing, render_all
+local ensure_scope, toggle_scope
+local rebuild_container, emon_batch
+local schedule_render, schedule_reconcile, toggle_main, note, show_help
+local has_live_timer, schedule_timer_tick
+
+-- --------------------------------------------------------------------- --
+-- helpers
+-- --------------------------------------------------------------------- --
+function note(msg)
+   ColourNote("cyan", "", "[emon] ", "silver", "", tostring(msg))
+end
+
+-- Our own "in-game" flag. We do NOT read GMCP for this: MUSHclient keeps stale
+-- char.base/char.status across a disconnect, so right after a reconnect GMCP still
+-- says "playing" while you're sitting at the username prompt. `entered` is set only
+-- by the in-game welcome line (or a genuine reload while playing) and cleared on
+-- connect/disconnect. Gates every MUD command so nothing leaks to the login screen.
+local function in_game()
+   return entered
+end
+
+-- GMCP "actively playing" states (per aard_inventory_serials). Trustworthy only
+-- when GMCP is current (a plugin reload while playing), NOT right after a reconnect.
+local function gmcp_playing()
+   local s = tonumber(gmcp("char.status.state"))
+   return s == 3 or s == 8 or s == 9 or s == 11
+end
+
+-- captured invdata lines arrive styled (invdata "breaks down" colours); recover
+-- the @-coded text, robust against a literal '@' in a name
+local function styleline_to_text(line)
+   for _, run in ipairs(line) do
+      run.text = run.text:gsub("@", "\0")
+   end
+   local text = StylesToColours(line):sub(3)
+   return (text:gsub("%z", "@"))
+end
+
+function make_record(w)
+   return {
+      id      = w[1],
+      flags   = w[2],
+      name    = w[3],                 -- keeps colour codes (for display)
+      plain   = strip_colours(w[3]),  -- codes stripped (for matching)
+      level   = tonumber(w[4]),
+      itype   = tonumber(w[5]),
+      unique  = (w[6] == "1"),
+      wearloc = tonumber(w[7]),
+      timer   = tonumber(w[8]),
+   }
+end
+
+function parse_invdata(style_lines)
+   local records = {}
+   for _, line in ipairs(style_lines) do
+      local _, _, w = invrex:match(styleline_to_text(line))
+      if w then records[#records + 1] = make_record(w) end
+   end
+   return records
+end
+
+-- --------------------------------------------------------------------- --
+-- item state
+-- --------------------------------------------------------------------- --
+function store_item(rec, loc)
+   local existing = items[rec.id]
+   rec.loc = loc
+   if existing then
+      rec.seq = existing.seq           -- keep display order across updates
+   else
+      seq_counter = seq_counter + 1
+      rec.seq = seq_counter
+   end
+   -- anchor the decay timer to wall-clock now (timer is seconds-remaining at pull
+   -- time; -1 = no timer). expiry is absolute, so the display can count down
+   -- client-side between pulls without re-issuing commands. Re-anchors on every
+   -- pull (a re-store) since that's the only fresh source of the seconds value.
+   if rec.timer and rec.timer >= 0 then
+      rec.expiry = os.time() + rec.timer
+   else
+      rec.expiry = nil
+   end
+   items[rec.id] = rec
+end
+
+function remove_item(id)
+   items[id] = nil
+end
+
+function is_monitored_cid(cid)
+   for _, mon in pairs(monitors) do
+      if mon.cache_id == cid then return true end
+   end
+   return false
+end
+
+-- move a known item; if unknown and it's entering a scope we display, resync
+function relocate(id, loc)
+   local it = items[id]
+   if it then
+      it.loc = loc
+   elseif loc == "inv" or is_monitored_cid(loc) then
+      schedule_reconcile()
+   end
+end
+
+-- records matching a predicate, in stable display order
+function collect(pred)
+   local out = {}
+   for _, it in pairs(items) do
+      if pred(it) then out[#out + 1] = it end
+   end
+   table.sort(out, function(a, b) return a.seq < b.seq end)
+   return out
+end
+
+-- --------------------------------------------------------------------- --
+-- aggregate / filter (display pipeline)
+-- --------------------------------------------------------------------- --
+function aggregate(records)
+   local bykey, order = {}, {}
+   for _, r in ipairs(records) do
+      local key = r.name .. "\1" .. tostring(r.level)
+      local st = bykey[key]
+      if not st then
+         st = { name = r.name, plain = r.plain, level = r.level,
+                itype = r.itype, flags = r.flags, count = 0 }
+         bykey[key] = st
+         order[#order + 1] = st
+      end
+      st.count = st.count + 1
+      -- a stack shows a SINGLE timer collapsed from its members: "soonest" (when
+      -- the count next drops) or "latest" (when you run out). Stacked identical
+      -- items each keep their own record (keyed by objectid) with its own timer;
+      -- only the displayed tag collapses to one.
+      if r.expiry then
+         if not st.expiry then
+            st.expiry = r.expiry
+         elseif stack_timer_mode == "latest" then
+            if r.expiry > st.expiry then st.expiry = r.expiry end
+         else
+            if r.expiry < st.expiry then st.expiry = r.expiry end
+         end
+      end
+   end
+   return order
+end
+
+function sort_stacks(stacks)   -- v1: original (seq) order; swap here for other sorts
+   return stacks
+end
+
+function matches_any(plain, terms)
+   local lower = plain:lower()
+   for _, t in ipairs(terms) do
+      if lower:find(t, 1, true) then return true end
+   end
+   return false
+end
+
+-- --------------------------------------------------------------------- --
+-- row formatting (matches the MUD's inventory layout)
+--   <count col, 7 wide><flags?>@w<name> @W(@G<level>@W)
+-- --------------------------------------------------------------------- --
+-- count field, padded to a fixed pixel width so names line up. With a monospace
+-- font this reproduces the old 7-char field exactly (every glyph is one space
+-- wide). With a proportional font there are no tab stops in a flow renderer, so
+-- it pads to the nearest whole space -- columns are approximate, jitter <= one
+-- space. Metrics are cached per window and re-measured when its font changes.
+function format_count(win, count)
+   local token = (count > 1) and ("(" .. count .. ")") or ""
+   local fk = win.textrect.font_name .. "/" .. win.textrect.font_size
+   if win._emon_fk ~= fk then
+      win._emon_fk  = fk
+      win._emon_ctw = win:text_width("(9999) ")        -- target field width
+      win._emon_spw = math.max(1, win:text_width(" ")) -- one space, never zero
+   end
+   local tokw = (token ~= "") and win:text_width(token) or 0
+   local pad  = math.max(1, math.ceil((win._emon_ctw - tokw) / win._emon_spw))
+   return "@W" .. token .. string.rep(" ", pad)
+end
+
+function format_flags(flags)
+   local parts = {}
+   for i = 1, #flags do
+      local c = flags:sub(i, i)
+      if not FLAG_SKIP[c] then
+         local info = FLAG_INFO[c]
+         if info then
+            local col = (use_short_flags and info.short_colour) or info.colour
+            parts[#parts + 1] = col .. (use_short_flags and info.short or info.long)
+         end
+      end
+   end
+   if #parts == 0 then return "" end
+   return table.concat(parts, use_short_flags and "" or " ") .. " "
+end
+
+function format_level(level)
+   return "@W(@G" .. tostring(level) .. "@W)@w"
+end
+
+-- duration shown down to seconds from the highest non-zero unit (e.g.
+-- "13d6h42m18s", "6h0m18s", "42m18s", "18s"). Always carrying seconds is
+-- deliberate: a 14-day key would otherwise sit on "14d" for an hour before the
+-- display changed -- showing the seconds lets you SEE it counting down.
+local function format_duration(sec)
+   local d = math.floor(sec / 86400)
+   local h = math.floor((sec % 86400) / 3600)
+   local m = math.floor((sec % 3600) / 60)
+   local s = sec % 60
+   if d > 0 then return d .. "d" .. h .. "h" .. m .. "m" .. s .. "s" end
+   if h > 0 then return h .. "h" .. m .. "m" .. s .. "s" end
+   if m > 0 then return m .. "m" .. s .. "s" end
+   return s .. "s"
+end
+
+-- colour by remaining seconds: < red threshold -> red, > yellow -> green, else
+-- yellow. Boundaries chosen so every value lands in exactly one band (no gaps).
+local function timer_colour(sec)
+   if sec < timer_red_h * 3600 then return "@R" end
+   if sec > timer_yellow_h * 3600 then return "@G" end
+   return "@Y"
+end
+
+-- "[1d6h]" coloured by urgency; "[expired]" (red) if already past
+local function format_timer_tag(expiry)
+   local sec = expiry - os.time()
+   local label = (sec > 0) and format_duration(sec) or "expired"
+   return timer_colour(sec) .. "[" .. label .. "]@w"
+end
+
+function format_row(win, st)
+   local row = format_count(win, st.count)
+   if show_flags then
+      row = row .. format_flags(st.flags)
+   end
+   -- reset to @w before the name so a name with no leading colour code doesn't
+   -- inherit the last flag's colour
+   row = row .. "@w" .. st.name .. " " .. format_level(st.level)
+   if st.expiry then row = row .. " " .. format_timer_tag(st.expiry) end
+   return row
+end
+
+function render_stacks(win, stacks)
+   if sort_mode ~= "type" then
+      for _, st in ipairs(stacks) do win:add_text(format_row(win, st), false) end
+      return
+   end
+   local groups, types = {}, {}
+   for _, st in ipairs(stacks) do
+      local g = groups[st.itype]
+      if not g then g = {}; groups[st.itype] = g; types[#types + 1] = st.itype end
+      g[#g + 1] = st
+   end
+   table.sort(types, function(a, b)
+      return (TYPE_NAME[a] or ("Type " .. a)) < (TYPE_NAME[b] or ("Type " .. b))
+   end)
+   for _, tnum in ipairs(types) do
+      win:add_text(SEPARATOR, false)
+      win:add_text("@x214Item Type: @W" .. (TYPE_NAME[tnum] or ("Type " .. tnum)), false)
+      for _, st in ipairs(groups[tnum]) do win:add_text(format_row(win, st), false) end
+   end
+   if #types > 0 then win:add_text(SEPARATOR, false) end
+end
+
+-- --------------------------------------------------------------------- --
+-- windows
+-- --------------------------------------------------------------------- --
+-- per-window font: defaults to the MUD's monospace output font until the user
+-- picks one via the window's right-click "Change Font" item. Stored per target
+-- ("main", "keyring", "vault", "mon_<key>") so each window is independent -- e.g.
+-- an 8pt overview alongside a 14pt single-potion monitor.
+local function get_font(target)
+   local n = GetVariable("font_" .. target .. "_name")
+   local s = tonumber(GetVariable("font_" .. target .. "_size"))
+   if not n or n == "" then n = GetAlphaOption("output_font_name") end  -- MUD output font
+   if not s then s = GetOption("output_font_height") end
+   return n, s
+end
+
+local function set_font_var(target, name, size)
+   SetVariable("font_" .. target .. "_name", name)
+   SetVariable("font_" .. target .. "_size", tostring(size))
+end
+
+-- target: persistence key for get_font/set_font_var. render_fn: redraw this
+-- window's contents (called after a font change, with the new metrics).
+function make_window(id, left, top, w, h, title, target, render_fn, on_close)
+   local font_name, font_size = get_font(target)
+   local win = ThemedTextWindow(
+      id, left, top, w, h, title,
+      "center",  -- title alignment
+      true,      -- is_temporary -> [X] close button
+      true,      -- resizeable
+      true,      -- text_scrollable
+      true,      -- text_selectable
+      true,      -- text_copyable
+      false,     -- url_hyperlinks
+      false,     -- autowrap (one item per line)
+      nil, nil,
+      font_name, -- per-target body font (default: MUD monospace output font)
+      font_size,
+      1000, nil, false, nil, nil,
+      "Close"
+   )
+   -- built-in "Change Font" item, like the stat monitor's right-click menu. The
+   -- native font picker, then loadFont changes the body font in place (no window
+   -- recreate, so position/menu/hotspots survive), persist it, and re-render.
+   table.insert(win.menu_table, 1, "Change Font")
+   table.insert(win.menu_handlers, 1, function()
+      local cn, cs = get_font(target)
+      local picked = utils.fontpicker(cn, cs)
+      if picked and picked.name then
+         set_font_var(target, picked.name, picked.size)
+         win.textrect:loadFont(picked.name, picked.size)
+         if render_fn then render_fn() end
+      end
+   end)
+   if on_close then
+      local base = win.do_on_delete
+      win.do_on_delete = function(self)
+         if base then base(self) end
+         if not suppress_close_hook then on_close() end
+      end
+   end
+   return win
+end
+
+function quiet_delete(win)
+   if not win then return end
+   suppress_close_hook = true
+   win:delete()
+   suppress_close_hook = false
+end
+
+function ensure_main_window()
+   if not main_window then
+      main_window = make_window(GetPluginID() .. "_main", 400, 120, 320, 420, "Inventory",
+         "main", render_main,
+         function()
+            main_window = nil
+            SetVariable("main_visible", "0")
+         end)
+   end
+end
+
+-- first carried container (type 11, loc "inv") whose name contains `term`
+function find_container(term)
+   local needle = term:lower()
+   local invs = collect(function(it) return it.loc == "inv" and it.itype == TYPE_CONTAINER end)
+   for _, it in ipairs(invs) do
+      if it.plain:lower():find(needle, 1, true) then
+         return it.id, it.plain, it.name
+      end
+   end
+   return nil
+end
+
+-- --------------------------------------------------------------------- --
+-- rendering (reads from `items`; no commands)
+-- --------------------------------------------------------------------- --
+-- render the items at a given loc into a window (used by main / keyring / vault)
+function render_window_loc(win, loc)
+   if not win then return end
+   win:clear(false)
+   local stacks = sort_stacks(aggregate(collect(function(it) return it.loc == loc end)))
+   if #stacks == 0 then
+      win:add_text("@D(empty)", false)
+   else
+      render_stacks(win, stacks)
+   end
+   win:draw()
+end
+
+function render_main()
+   render_window_loc(main_window, "inv")
+end
+
+function render_monitor_missing(mon)
+   local win = mon.window
+   if not win then return end
+   win:clear(false)
+   win:add_text("@RNo carried container matching '@w" .. mon.term .. "@R'.@w", false)
+   win:draw()
+end
+
+function render_monitor(mon)
+   local win = mon.window
+   if not win then return end
+   local cid, _, cname = find_container(mon.term)
+   mon.cache_id = cid
+   if not cid then render_monitor_missing(mon); return end
+
+   local recs = collect(function(it) return it.loc == cid end)
+   if #mon.filters > 0 then
+      local kept = {}
+      for _, r in ipairs(recs) do
+         if matches_any(r.plain, mon.filters) then kept[#kept + 1] = r end
+      end
+      recs = kept
+   end
+   local stacks = sort_stacks(aggregate(recs))
+   local total = 0
+   for _, st in ipairs(stacks) do total = total + st.count end
+
+   win:clear(false)
+   local hdr = (cname or mon.term)
+   if #mon.filters > 0 then hdr = hdr .. " @D[@w" .. table.concat(mon.filters, ", ") .. "@D]" end
+   hdr = hdr .. " @W(" .. total .. ")@w"
+   win:add_text(hdr, false)
+   if #stacks == 0 then
+      win:add_text("@D(none)", false)
+   else
+      render_stacks(win, stacks)
+   end
+   win:draw()
+end
+
+function render_all()
+   render_main()
+   for _, name in ipairs(SCOPE_ORDER) do
+      render_window_loc(scope_win[SCOPES[name].loc], SCOPES[name].loc)
+   end
+   for _, mon in pairs(monitors) do render_monitor(mon) end
+end
+
+-- scope windows (keyring / vault): fixed-location displays toggled by command
+function ensure_scope(sc)
+   if not scope_win[sc.loc] then
+      scope_win[sc.loc] = make_window(GetPluginID() .. "_" .. sc.loc, sc.x, sc.y, 280, 360,
+         sc.title, sc.loc, function() render_window_loc(scope_win[sc.loc], sc.loc) end,
+         function() scope_win[sc.loc] = nil; SetVariable(sc.var, "0") end)
+   end
+end
+
+function toggle_scope(sc)
+   if scope_win[sc.loc] then
+      quiet_delete(scope_win[sc.loc]); scope_win[sc.loc] = nil
+      SetVariable(sc.var, "0")
+   elseif not in_game() then
+      note("Open the " .. sc.title .. " window once you're in-game.")
+   else
+      -- pull first; open the window only if data actually came back, so `emon
+      -- vault` with no vault just shows the MUD's message and opens nothing
+      emon_batch({ sc.cmd }, function()
+         local got = false
+         for _, it in pairs(items) do if it.loc == sc.loc then got = true; break end end
+         -- keyring (always_open) opens even when empty -- a keyring is something
+         -- you always have, the MUD says nothing when it's empty, and an empty
+         -- window reads better than a silent no-op. vault opens only on data: "no
+         -- vault" is a real distinct state the MUD announces itself, so a duplicate
+         -- [emon] line would just be noise.
+         if got or sc.always_open then
+            ensure_scope(sc)
+            SetVariable(sc.var, "1")
+            render_window_loc(scope_win[sc.loc], sc.loc)
+         end
+      end)
+   end
+end
+
+-- --------------------------------------------------------------------- --
+-- batch capture: send `config compact YES` + `config prompt NO` (GMCP), fire a
+-- set of data commands, then `echo {emon-done}` -- all at once, so the config is
+-- in effect before any command runs. Each {tag}...{/tag} block in the reply is
+-- captured, omitted, and dispatched to rebuild_container(loc, records); anything
+-- else (a channel line, etc.) passes through. The sentinel restores config and
+-- ends the batch. Config is toggled ONCE per batch (no per-command toggling, so
+-- no GMCP-read race) and there is no blank-eater. See the emon_cap_* triggers.
+-- (Uses plain `echo`; a level 202+ immortal would need `echo self`.)
+-- --------------------------------------------------------------------- --
+local function cap_teardown()
+   EnableTrigger("emon_cap_start", false)
+   EnableTrigger("emon_cap_end", false)
+   EnableTrigger("emon_cap_body", false)
+   EnableTrigger("emon_cap_sentinel", false)
+end
+
+-- Config is suppressed ONCE and held across all chained batches, then restored
+-- only when the queue finally drains. (Reading config per batch caught a stale
+-- GMCP value mid-restore: round 2 saw the not-yet-arrived restore, thought prompts
+-- were already off, skipped re-suppressing, and its prompts leaked. The v0.5 bug.)
+local cfg_orig = nil   -- {compact, prompt} captured when suppression began; nil = not suppressed
+
+local function suppress_config()
+   if cfg_orig then return end   -- already suppressed for this run of batches
+   cfg_orig = { compact = gmcp("config.compact") or "NO",
+                prompt  = gmcp("config.prompt")  or "YES" }
+   if cfg_orig.compact ~= "YES" then Send_GMCP_Packet("config compact YES") end
+   if cfg_orig.prompt  ~= "NO"  then Send_GMCP_Packet("config prompt NO")  end
+end
+
+local function restore_config()
+   if not cfg_orig then return end
+   if cfg_orig.compact ~= "YES" then Send_GMCP_Packet("config compact " .. cfg_orig.compact) end
+   if cfg_orig.prompt  ~= "NO"  then Send_GMCP_Packet("config prompt "  .. cfg_orig.prompt)  end
+   cfg_orig = nil
+end
+
+local function start_batch(b)
+   batch_gen = batch_gen + 1
+   cap = { loc = nil, lines = {}, on_done = b.on_done, gen = batch_gen }
+   suppress_config()   -- sets config once; a no-op for chained batches (round 2, etc.)
+   EnableTrigger("emon_cap_start", true)
+   EnableTrigger("emon_cap_end", true)
+   EnableTrigger("emon_cap_sentinel", true)
+   for _, c in ipairs(b.commands) do SendNoEcho(c) end
+   SendNoEcho("echo {emon-done}")
+   DoAfterSpecial(8, "Emon_batch_timeout(" .. batch_gen .. ")", sendto.script)  -- safety net
+end
+
+local function finish_batch()
+   local done = cap and cap.on_done
+   cap_teardown()
+   cap = nil
+   if done then done() end                          -- may queue the next batch
+   if batch_queue[1] then
+      start_batch(table.remove(batch_queue, 1))      -- more batches: keep config suppressed
+   else
+      restore_config()                               -- all done: restore config
+   end
+end
+
+-- queue a batch (one runs at a time). `commands` is a list of command strings.
+function emon_batch(commands, on_done)
+   if not in_game() then return end
+   batch_queue[#batch_queue + 1] = { commands = commands, on_done = on_done }
+   if not cap then start_batch(table.remove(batch_queue, 1)) end
+end
+
+-- capture trigger handlers (global: named by the emon_cap_* triggers' script=)
+function Emon_cap_start(name, line, wildcards)
+   if not cap then return end
+   local tag, id = wildcards[1], Trim(wildcards[2] or "")
+   if     tag == "invdata" then cap.loc = (id ~= "" and id) or "inv"
+   elseif tag == "eqdata"  then cap.loc = "worn"
+   elseif tag == "keyring" then cap.loc = "keyring"
+   elseif tag == "vault"   then cap.loc = "vault" end
+   cap.lines = {}
+   EnableTrigger("emon_cap_body", true)
+   StopEvaluatingTriggers(true)   -- don't let the catch-all body re-process this tag
+end
+
+function Emon_cap_body(name, line, wildcards, styles)
+   if cap then cap.lines[#cap.lines + 1] = styles end
+end
+
+function Emon_cap_end(name, line, wildcards)
+   EnableTrigger("emon_cap_body", false)
+   if cap and cap.loc then
+      rebuild_container(cap.loc, parse_invdata(cap.lines))
+      cap.loc, cap.lines = nil, {}
+   end
+   StopEvaluatingTriggers(true)
+end
+
+function Emon_cap_sentinel(name, line, wildcards)
+   finish_batch()
+   StopEvaluatingTriggers(true)
+end
+
+function Emon_batch_timeout(g)   -- global: DoAfterSpecial safety net
+   if cap and cap.gen == tonumber(g) then finish_batch() end
+end
+
+-- Rebuild a scope (loc = "inv" / "worn" / a container id / "keyring" / "vault")
+-- from an authoritative data pull: store the records, drop any at that loc that
+-- are gone, redraw. The batch capture dispatches every block through here.
+function rebuild_container(loc, records)
+   local seen = {}
+   for _, rec in ipairs(records) do store_item(rec, loc); seen[rec.id] = true end
+   for id, it in pairs(items) do
+      if it.loc == loc and not seen[id] then items[id] = nil end
+   end
+   schedule_render()
+end
+
+function refresh_all()   -- global: in-game baseline, `emon refresh`, reconcile
+   if not in_game() then return end   -- never pull at the login screen
+   if not main_window and not next(monitors) and not next(scope_win) then return end
+   -- round 1: carried inventory + worn gear + any open scope windows
+   local r1 = { "invdata", "eqdata" }
+   for _, name in ipairs(SCOPE_ORDER) do
+      if scope_win[SCOPES[name].loc] then r1[#r1 + 1] = SCOPES[name].cmd end
+   end
+   emon_batch(r1, function()
+      -- round 2: the contents of every carried container (ids learned in round 1)
+      local r2 = {}
+      for _, it in ipairs(collect(function(i)
+            return i.loc == "inv" and i.itype == TYPE_CONTAINER end)) do
+         r2[#r2 + 1] = "invdata " .. it.id
+      end
+      if #r2 > 0 then emon_batch(r2, render_all) else render_all() end
+   end)
+end
+
+-- --------------------------------------------------------------------- --
+-- debounced render (live) and reconcile (resync)
+-- --------------------------------------------------------------------- --
+-- Render synchronously. (A deferred draw via DoAfterSpecial does not repaint
+-- reliably right after a window is created, which left windows blank until a
+-- manual toggle forced a direct render.)
+function schedule_render()
+   render_all()
+end
+
+function schedule_reconcile()
+   if reconcile_pending then return end
+   reconcile_pending = true
+   DoAfterSpecial(0.3, "Emon_do_reconcile()", sendto.script)
+end
+
+function Emon_do_reconcile()   -- global: DoAfterSpecial target
+   reconcile_pending = false
+   refresh_all()
+end
+
+-- --------------------------------------------------------------------- --
+-- expiry-timer tick: a self-rescheduling redraw (NO commands sent) so the
+-- countdowns visibly tick down between pulls. The seconds value only refreshes
+-- on an actual pull (`emon refresh`, reopening keyring, etc.); this just recomputes
+-- the display from each item's stored expiry. Runs while in-game; only repaints
+-- when something on screen actually has a timer.
+-- --------------------------------------------------------------------- --
+local timer_tick_scheduled = false
+
+function has_live_timer()
+   for _, it in pairs(items) do
+      if it.expiry then return true end
+   end
+   return false
+end
+
+function schedule_timer_tick()
+   if timer_tick_scheduled then return end
+   timer_tick_scheduled = true
+   DoAfterSpecial(timer_tick_secs, "Emon_timer_tick()", sendto.script)
+end
+
+function Emon_timer_tick()   -- global: DoAfterSpecial target
+   timer_tick_scheduled = false
+   if not in_game() then return end    -- loop stops on disconnect; go-live restarts it
+   if has_live_timer() then
+      -- a tick changes only the timer text, never the line count, so save each
+      -- window's scroll and restore it after the redraw -- otherwise a scrolled
+      -- keyring would snap back to the top every 30 seconds
+      local saved = {}
+      local function remember(w) if w then saved[#saved + 1] = { w, w.textrect:getScroll() } end end
+      remember(main_window)
+      for _, w in pairs(scope_win) do remember(w) end
+      for _, mon in pairs(monitors) do remember(mon.window) end
+      render_all()
+      for _, pair in ipairs(saved) do pair[1]:set_scroll(pair[2]) end
+   end
+   schedule_timer_tick()               -- keep ticking; timers may appear/refresh
+end
+
+-- --------------------------------------------------------------------- --
+-- live event handlers (no commands)
+-- --------------------------------------------------------------------- --
+-- {invmon}action,objectid,containerid,wear-loc
+function emon_on_invmon(name, line, wildcards)
+   local a, oid, cid = wildcards[1]:match("^(%d+),(%d+),(-?%d+)")
+   local action = tonumber(a)
+   if not action then return end
+
+   if action == 3 or action == 7 then
+      remove_item(oid)                  -- dropped/given/consumed
+   elseif action == 2 then
+      relocate(oid, "worn")             -- worn
+   elseif action == 6 then
+      relocate(oid, cid)                -- into a container
+   elseif action == 9 then
+      relocate(oid, "vault")            -- put into vault
+   elseif action == 11 then
+      relocate(oid, "keyring")          -- put onto keyring
+   elseif action == 1 or action == 4 or action == 5 or action == 10 or action == 12 then
+      relocate(oid, "inv")              -- (un)worn / added / out of container / from vault/keyring
+   else
+      return
+   end
+   schedule_render()
+end
+
+-- {invitem}id,flags,name,...  (literal @-codes; full data for a genuine add)
+function emon_on_invitem(name, line, wildcards)
+   local _, _, w = invrex:match(wildcards[1])
+   if w then
+      store_item(make_record(w), "inv")
+      schedule_render()
+   end
+end
+
+-- --------------------------------------------------------------------- --
+-- commands
+-- --------------------------------------------------------------------- --
+local function cmd_monitor(rest)
+   rest = Trim(rest or "")
+   -- container term: a quoted "..."/'...' string (allows spaces, so you can tell
+   -- apart two containers that share a keyword like "bag"), else the first
+   -- whitespace-delimited word. The remainder is the optional comma name list.
+   local term, namelist
+   local q = rest:sub(1, 1)
+   if q == '"' or q == "'" then
+      term, namelist = rest:match("^" .. q .. "([^" .. q .. "]+)" .. q .. "%s*(.*)$")
+   else
+      term, namelist = rest:match("^(%S+)%s*(.*)$")
+   end
+   if not term or term == "" then
+      note("Usage: emon monitor <container> [name,list]  (quote to match multiple words: \"Bag of Aardwolf\")")
+      return
+   end
+   local key = term:lower()
+   local filters = {}
+   for w in (namelist or ""):gmatch("[^,]+") do
+      local t = Trim(w):lower()
+      if t ~= "" then filters[#filters + 1] = t end
+   end
+
+   if monitors[key] and monitors[key].window then
+      quiet_delete(monitors[key].window)
+   end
+   local offset = 0
+   for _ in pairs(monitors) do offset = offset + 1 end
+   local mon_target = "mon_" .. key:gsub("%W", "")
+   local win = make_window(GetPluginID() .. "_" .. mon_target,
+                           740, 120 + offset * 30, 260, 320, term,
+                           mon_target, function() render_monitor(monitors[key]) end,
+                           function() monitors[key] = nil end)
+   monitors[key] = { term = term, filters = filters, window = win }
+
+   note("Monitoring '" .. term .. "'" ..
+        (#filters > 0 and (" for: " .. table.concat(filters, ", ")) or "") .. ".")
+
+   -- baseline just this container's contents (one pull, not a full resync)
+   local cid = find_container(term)
+   monitors[key].cache_id = cid
+   if cid then
+      emon_batch({ "invdata " .. cid }, function() render_monitor(monitors[key]) end)
+   else
+      render_monitor(monitors[key])
+   end
+end
+
+local function cmd_unmonitor(rest)
+   local key = Trim(rest or "")
+   -- accept the same quoting as `monitor` (a multi-word term also works unquoted,
+   -- since the whole remainder is the key)
+   key = (key:match('^"(.+)"$') or key:match("^'(.+)'$") or key):lower()
+   if key == "" then note("Usage: emon unmonitor <container>"); return end
+   local mon = monitors[key]
+   if not mon then note("No monitor named '" .. key .. "'."); return end
+   quiet_delete(mon.window)
+   monitors[key] = nil
+   note("Stopped monitoring '" .. key .. "'.")
+end
+
+-- a threshold token: a number of hours, or with a d/h/m/s suffix. Returns hours
+-- (fractional for m/s). e.g. "7d"->168, "24h"/"168"->that, "10m"->1/6, "30s"->1/120
+local function parse_hours(s)
+   local num, unit = s:match("^([%d%.]+)([dhms]?)$")
+   num = tonumber(num)
+   if not num then return nil end
+   if unit == "d" then return num * 24 end
+   if unit == "m" then return num / 60 end
+   if unit == "s" then return num / 3600 end
+   return num   -- "h" or no suffix
+end
+
+local function hours_str(h)   -- compact threshold label, zero units omitted: "7d" / "1d12h" / "10m" / "30s"
+   local secs = math.floor(h * 3600 + 0.5)
+   local d  = math.floor(secs / 86400); secs = secs % 86400
+   local hh = math.floor(secs / 3600);  secs = secs % 3600
+   local mm = math.floor(secs / 60)
+   local ss = secs % 60
+   local out = ""
+   if d  > 0 then out = out .. d  .. "d" end
+   if hh > 0 then out = out .. hh .. "h" end
+   if mm > 0 then out = out .. mm .. "m" end
+   if ss > 0 then out = out .. ss .. "s" end
+   return (out ~= "") and out or "0s"
+end
+
+local function cmd_timer(rest)
+   rest = Trim(rest or "")
+   if rest ~= "" then
+      local a, b = rest:match("^(%S+)%s+(%S+)$")
+      local red    = a and parse_hours(a)
+      local yellow = b and parse_hours(b)
+      if not red or not yellow then
+         note("Usage: emon timer <red> <yellow>  (hours, or use d/h: 'emon timer 1d 7d')")
+         return
+      end
+      if red <= 0 or yellow <= 0 or red >= yellow then
+         note("Need 0 < red < yellow (red is the more-urgent, smaller threshold).")
+         return
+      end
+      timer_red_h, timer_yellow_h = red, yellow
+      SetVariable("timer_red_h",    tostring(red))
+      SetVariable("timer_yellow_h", tostring(yellow))
+      render_all()
+   end
+   -- AnsiNote (not note) so the colour words actually render in their colour
+   AnsiNote(ColoursToANSI(
+      "@C[emon]@w Expiry colours -- @Rred@w under " .. hours_str(timer_red_h) ..
+      ", @Yyellow@w from " .. hours_str(timer_red_h) .. " to " .. hours_str(timer_yellow_h) ..
+      ", @Ggreen@w over " .. hours_str(timer_yellow_h) .. "."))
+end
+
+local function cmd_stacktimer(rest)
+   local mode = Trim(rest or ""):lower()
+   if mode == "" then
+      stack_timer_mode = (stack_timer_mode == "latest") and "soonest" or "latest"  -- toggle
+   elseif mode == "soonest" or mode == "latest" then
+      stack_timer_mode = mode
+   else
+      note("Usage: emon stacktimer [soonest|latest]")
+      return
+   end
+   SetVariable("stack_timer", stack_timer_mode)
+   note("Stacked items show the " .. stack_timer_mode .. " expiry (" ..
+        (stack_timer_mode == "latest" and "when you run out" or "when the count next drops") .. ").")
+   render_all()
+end
+
+local function cmd_tickrate(rest)
+   local arg = Trim(rest or "")
+   if arg ~= "" then
+      local n = tonumber(arg)
+      if not n or n < 1 then
+         note("Usage: emon tickrate <seconds>  (whole seconds, 1 or more)")
+         return
+      end
+      timer_tick_secs = math.floor(n)
+      SetVariable("timer_tick_secs", tostring(timer_tick_secs))
+      schedule_timer_tick()   -- ensure the loop is running; new period applies from the next tick
+   end
+   note("Expiry countdown redraws every " .. timer_tick_secs .. "s.")
+end
+
+-- dump as much internal state as is useful for diagnosing behaviour. `emon debug`
+-- shows the whole state machine (lifecycle, GMCP, settings, capture, windows, item
+-- tallies); `emon debug items` adds a line per tracked item (can be 100+ lines).
+local function cmd_debug(rest)
+   local function p(s)  AnsiNote(ColoursToANSI(s)) end
+   local function yn(b) return b and "@Gy@w" or "@Rn@w" end
+   local arg = Trim(rest or ""):lower()
+
+   local total, with_timer, by_loc, list = 0, 0, {}, {}
+   for _, it in pairs(items) do
+      total = total + 1
+      by_loc[it.loc] = (by_loc[it.loc] or 0) + 1
+      if it.expiry then with_timer = with_timer + 1 end
+      list[#list + 1] = it
+   end
+
+   p("@C===== emon debug =====@w")
+   p("@Wlifecycle@w  connected=" .. yn(IsConnected()) .. " in_game=" .. yn(in_game()) ..
+     " entered=" .. yn(entered) .. " gmcp_playing=" .. yn(gmcp_playing()) ..
+     " golive_pending=" .. yn(golive_pending) .. " reconcile_pending=" .. yn(reconcile_pending))
+   p("@Wgmcp@w       state=" .. tostring(gmcp("char.status.state")) ..
+     " name=" .. tostring(gmcp("char.base.name")) ..
+     " config.compact=" .. tostring(gmcp("config.compact")) ..
+     " config.prompt=" .. tostring(gmcp("config.prompt")))
+   p("@Wdisplay@w    flags=" .. yn(show_flags) .. " short_flags=" .. yn(use_short_flags) ..
+     " sort=" .. sort_mode)
+   p("@Wtimers@w     red=" .. timer_red_h .. "h yellow=" .. timer_yellow_h .. "h stack=" ..
+     stack_timer_mode .. " tickrate=" .. timer_tick_secs .. "s tick_scheduled=" ..
+     yn(timer_tick_scheduled) .. " items_with_timer=" .. with_timer)
+   if cap then
+      p("@Wcapture@w    ACTIVE loc=" .. tostring(cap.loc) .. " lines=" .. #cap.lines ..
+        " gen=" .. tostring(cap.gen) .. " queued=" .. #batch_queue .. " batch_gen=" .. batch_gen)
+   else
+      p("@Wcapture@w    idle queued=" .. #batch_queue .. " batch_gen=" .. batch_gen)
+   end
+   p("@Wmain win@w   " .. (main_window and "@Gopen" or "@Rclosed") .. "@w")
+   local sc = {}
+   for _, name in ipairs(SCOPE_ORDER) do
+      sc[#sc + 1] = name .. "=" .. (scope_win[SCOPES[name].loc] and "open" or "closed")
+   end
+   p("@Wscope wins@w " .. table.concat(sc, " "))
+   local nmon = 0
+   for _ in pairs(monitors) do nmon = nmon + 1 end
+   p("@Wmonitors@w   " .. nmon)
+   for key, mon in pairs(monitors) do
+      p("  @Y" .. key .. "@w term='" .. mon.term .. "' filters=[" .. table.concat(mon.filters, ",") ..
+        "] cid=" .. tostring(mon.cache_id) .. " win=" .. (mon.window and "open" or "closed"))
+   end
+   p("@Witems@w      total=" .. total .. " seq_counter=" .. seq_counter)
+   local locs = {}
+   for loc in pairs(by_loc) do locs[#locs + 1] = loc end
+   table.sort(locs)
+   for _, loc in ipairs(locs) do
+      local citem = items[loc]
+      local label = citem and (loc .. " (" .. citem.plain .. ")") or loc
+      p("  @Wloc " .. label .. ":@w " .. by_loc[loc])
+   end
+   if arg == "items" then
+      table.sort(list, function(a, b) return a.seq < b.seq end)
+      for _, it in ipairs(list) do
+         local left = it.expiry and format_duration(math.max(0, it.expiry - os.time())) or "-"
+         p("  @D#" .. it.seq .. "@w id=" .. it.id .. " loc=" .. tostring(it.loc) ..
+           " ty=" .. it.itype .. "(" .. (TYPE_NAME[it.itype] or "?") .. ") timer=" ..
+           tostring(it.timer) .. " left=" .. left .. " @w" .. it.plain)
+      end
+   else
+      p("@D(emon debug items -- list every tracked item)@w")
+   end
+end
+
+function show_help()
+   local function p(coded) AnsiNote(ColoursToANSI(coded)) end
+   local function center(s)   -- centre s inside an 80-wide @c box row
+      local inner = 78
+      local left = math.floor((inner - #s) / 2)
+      return "@c|" .. string.rep(" ", left) .. s .. string.rep(" ", inner - #s - left) .. "|"
+   end
+   local bar = "@c" .. string.rep("-", 80)
+
+   p("")
+   p(bar)
+   p(center("Epsilon's Inventory Monitor"))
+   p(center("Vibe coded with Claude, but doesn't suck."))
+   p(bar)
+   p("@Yemon")
+   p("@c     Toggle all inventory windows.")
+   p("@c")
+   p("@Yemon monitor @W<container> @c[@Wnames@c]")
+   p("@c     Tracks a carried container in its own window.")
+   p("@c")
+   p("@W     <container>@c matches the NAME of a container you carry, e.g. @Wbag@c or")
+   p("@c     @W'bag of aardwolf'@c. Accepts quotes for multiple words, first match wins.")
+   p("@c     Note: It does *not* accept 2.'foo bar' syntax at this time.")
+   p("@c")
+   p("@W     [names]@c is a comma-separated NAME LIST matched against displayed")
+   p("@c     item names (NOT the keyword). For example:")
+   p("@c          @Yemon monitor 'Bag of Aardwolf' duff, Cobra Blood")
+   p("@c     This shows bag items whose name contains 'duff' or 'Cobra Blood' in the")
+   p("@c     monitored window. Quotes around the item names to monitor are")
+   p("@c     unnecessary, even when multi-word.")
+   p("@c")
+   p("@c     Color codes and case are ignored when matching, so it should work")
+   p("@c     whether you're copying with colors or not.")
+   p("@c")
+   p("@Yemon unmonitor @W<container>")
+   p("@c     Closes a monitor window (you can also click the ! in the top-left")
+   p("@c     corner of a window to close it)")
+   p("@c")
+   p("@Yemon keyring")
+   p("@c     Toggle a window showing your keyring contents.")
+   p("@c")
+   p("@Yemon vault")
+   p("@c     Toggle a window showing your vault contents. Returns the stock error from")
+   p("@c     \"vault list\" if you don't have one.")
+   p("@c")
+   p("@Yemon sort @W[inv|type]")
+   p("@c     Choose between displaying windows in inventory order or grouped by item")
+   p("@c     type. Type order is like the \"invsort type\" command. Applies to all")
+   p("@c     windows.")
+   p("@c")
+   p("@Yemon flags")
+   p("@c     Toggles display of item flags on/off.")
+   p("@c")
+   p("@Yemon shortflags")
+   p("@c     Toggles short @W(G)@c vs long @W(Glow)@c flags, similar to the")
+   p("@c     'shortflags' command.")
+   p("@c")
+   p("@Yemon timer @c[@Wred yellow@c]")
+   p("@c     Items with a timer (i.e. keys) show the amount of time left. The default")
+   p("@c     display shows items with less than 24 hours left in @Rred@c, 24 to 168")
+   p("@c     hours (1 to 7 days) in @Yyellow@c, and more than 168 hours in @Ggreen@c.")
+   p("@c")
+   p("@c     The two thresholds can be set as desired, using d/h/m/s to specify days,")
+   p("@c     hours, minutes, or seconds. A number with no identifier assumes hours.")
+   p("@c     Example:")
+   p("@c          @Yemon timer 10m 168@c")
+   p("@c")
+   p("@c     The above would set the lower threshold to 10 minutes, and the upper")
+   p("@c     threshold to 168 hours (7 days).")
+   p("@c")
+   p("@c     Using @Yemon timer@c shows the current thresholds.")
+   p("@c")
+   p("@Yemon stacktimer @c[@Wsoonest|latest@c]")
+   p("@c     By default, items show their timer and color based on the @Wsoonest@c")
+   p("@c     item expiry. This command can change it to base the color and timer on")
+   p("@c     the @Wlatest@c item in the stack to expire instead. Without an argument,")
+   p("@c     the command toggles the display type.")
+   p("@c")
+   p("@Yemon tickrate @c[@Wseconds@c]")
+   p("@c     How often the item countdown display redraws in windows (default 1s). If")
+   p("@c     things feel laggy with a lot of keys, try setting this higher to reduce")
+   p("@c     how often it refreshes.")
+   p("@c")
+   p("@Yemon refresh")
+   p("@c     Resyncs all inventory from the game. Use this if something's acting weird.")
+   p("@c")
+   p("@Yemon invmon")
+   p("@c     Re-enables the \"invmon\" tags. This should happen on startup, but this is")
+   p("@c     a reminder for if it doesn't work. Also, if you uninstall, you'll need")
+   p("@c     to enter \"invmon\" to turn the tags off.")
+   p("@c")
+   p("@Yemon help")
+   p("@c     This helpfile. Consider yourself PKed.")
+   p(bar)
+   p("@w")
+end
+
+function emon_command(name, line, wildcards)
+   local args = Trim(wildcards[1] or "")
+   local sub, rest = args:match("^(%S*)%s*(.*)$")
+   sub = (sub or ""):lower()
+
+   if sub == "" then
+      toggle_main()
+   elseif sub == "monitor" then
+      cmd_monitor(rest)
+   elseif sub == "unmonitor" or sub == "unmon" then
+      cmd_unmonitor(rest)
+   elseif sub == "keyring" then
+      toggle_scope(SCOPES.keyring)
+   elseif sub == "vault" then
+      toggle_scope(SCOPES.vault)
+   elseif sub == "sort" then
+      local mode = Trim(rest):lower()
+      if mode == "" then
+         sort_mode = (sort_mode == "type") and "inv" or "type"
+      elseif mode == "inv" or mode == "type" then
+         sort_mode = mode
+      else
+         note("Usage: emon sort [inv|type]"); return
+      end
+      SetVariable("sort_mode", sort_mode)
+      note("Sort: " .. (sort_mode == "type" and "grouped by item type." or "inventory order."))
+      render_all()
+   elseif sub == "flags" then
+      show_flags = not show_flags
+      SetVariable("show_flags", show_flags and "1" or "0")
+      note("Item flags " .. (show_flags and "shown." or "hidden."))
+      render_all()
+   elseif sub == "shortflags" then
+      use_short_flags = not use_short_flags
+      SetVariable("short_flags", use_short_flags and "1" or "0")
+      note("Flag labels: " .. (use_short_flags and "short, e.g. (K)." or "long, e.g. (Kept)."))
+      render_all()
+   elseif sub == "timer" then
+      cmd_timer(rest)
+   elseif sub == "stacktimer" then
+      cmd_stacktimer(rest)
+   elseif sub == "tickrate" then
+      cmd_tickrate(rest)
+   elseif sub == "refresh" then
+      refresh_all()
+   elseif sub == "invmon" then
+      SendNoEcho("invmon on")
+      note("Sent 'invmon on'.")
+   elseif sub == "debug" then
+      cmd_debug(rest)
+   elseif sub == "help" then
+      show_help()
+   else
+      note("Unknown command '" .. sub .. "'. Try 'emon help'.")
+   end
+end
+
+-- --------------------------------------------------------------------- --
+-- lifecycle
+-- --------------------------------------------------------------------- --
+-- enter the game for real: enable tags, open the window, baseline. Guarded by
+-- in_game() (our own flag), with a small delay so the room/login output settles.
+function Emon_go_live()   -- global: DoAfterSpecial target
+   golive_pending = false
+   if not in_game() then return end
+   SendNoEcho("invmon on")          -- enable live tags; never turned off
+   if (GetVariable("main_visible") or "1") == "1" then
+      ensure_main_window()
+      for _, name in ipairs(SCOPE_ORDER) do
+         if GetVariable(SCOPES[name].var) == "1" then ensure_scope(SCOPES[name]) end
+      end
+   end
+   refresh_all()                    -- baseline state from the MUD
+   schedule_timer_tick()            -- start the expiry countdown redraw loop
+end
+
+-- go live shortly, de-duped (welcome line + a reload check can coincide)
+local function schedule_golive()
+   if golive_pending then return end
+   golive_pending = true
+   DoAfterSpecial(0.25, "Emon_go_live()", sendto.script)
+end
+
+-- the in-game "Welcome to Aardwolf" line: our reliable "you're in now" signal
+function emon_on_ingame()
+   entered = true
+   schedule_golive()
+end
+
+-- master visibility toggle for ALL emon windows (main + monitors)
+function toggle_main()
+   if (GetVariable("main_visible") or "1") == "1" then
+      if main_window then main_window:hide() end
+      for _, w in pairs(scope_win) do w:hide() end
+      for _, mon in pairs(monitors) do if mon.window then mon.window:hide() end end
+      SetVariable("main_visible", "0")
+   else
+      ensure_main_window()
+      main_window:show()
+      for _, name in ipairs(SCOPE_ORDER) do
+         if GetVariable(SCOPES[name].var) == "1" then ensure_scope(SCOPES[name]) end
+      end
+      for _, w in pairs(scope_win) do w:show() end
+      for _, mon in pairs(monitors) do if mon.window then mon.window:show() end end
+      SetVariable("main_visible", "1")
+      if next(items) then render_all() else refresh_all() end
+   end
+end
+
+function OnPluginConnect()
+   entered = false   -- at the login screen; ignore stale GMCP, wait for the welcome line
+end
+
+function OnPluginDisconnect()
+   entered = false
+end
+
+function OnPluginInstall()
+   -- (re)loaded: if we loaded while already playing (a reload, so GMCP is current,
+   -- not stale), go live now. A fresh login is handled by the welcome-line trigger.
+   if IsConnected() and gmcp_playing() then
+      entered = true
+      schedule_golive()
+   end
+end
+
+function OnPluginEnable()
+   OnPluginInstall()
+end
+
+function OnPluginClose()
+   quiet_delete(main_window)
+   main_window = nil
+   for _, w in pairs(scope_win) do quiet_delete(w) end
+   scope_win = {}
+   for _, mon in pairs(monitors) do quiet_delete(mon.window) end
+   monitors = {}
+end
+
+function OnPluginDisable()
+   OnPluginClose()
+end
+
+function OnPluginListChanged()
+   dofile "lua/aard_requirements.lua"
+end
+]]>
+</script>
+</muclient>

@@ -1,0 +1,12 @@
+# Public repo: deny everything by default, then explicitly allow only the plugin
+# files we intend to publish. This keeps References/, other people's plugins,
+# design notes, and anything private out unless it is un-ignored below. Verify
+# with `git ls-files` before pushing.
+/*
+!/.gitignore
+!/LICENSE
+!/README.md
+!/Aardwolf Inventory Window/
+/Aardwolf Inventory Window/*
+!/Aardwolf Inventory Window/Epsilon_Inventory_Monitor.xml
+!/Aardwolf Inventory Window/README.md
