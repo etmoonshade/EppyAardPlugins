@@ -2,6 +2,8 @@
 
 *Vibe coded with Claude, but doesn't suck.*
 
+![Epsilon's Inventory Monitor — main inventory, keyring, and a monitored container with live decay timers](AardwolfInventoryWindow.PNG)
+
 A live inventory display for [Aardwolf](https://www.aardwolf.com/) on MUSHclient. It shows
 your carried inventory, per-container monitors, your keyring, and your vault in
 miniwindows — with item flags and decay-timer countdowns — kept up to date from the game's
