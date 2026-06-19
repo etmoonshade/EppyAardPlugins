@@ -38,7 +38,7 @@
    purpose="Live inventory display window for Aardwolf"
    date_written="2026-06-17 00:00:00"
    requires="5.07"
-   version="0.12"
+   version="0.13"
    save_state="y"
    sequence="100"
 >
@@ -220,7 +220,7 @@ local render_main, render_window_loc, render_monitor, render_monitor_missing, re
 local ensure_scope, toggle_scope
 local rebuild_container, emon_batch
 local schedule_render, schedule_reconcile, toggle_main, note, show_help
-local has_live_timer, schedule_timer_tick
+local has_live_timer, schedule_timer_tick, schedule_live_render
 
 -- --------------------------------------------------------------------- --
 -- helpers
@@ -817,10 +817,29 @@ end
 -- --------------------------------------------------------------------- --
 -- debounced render (live) and reconcile (resync)
 -- --------------------------------------------------------------------- --
--- Render synchronously. (A deferred draw via DoAfterSpecial does not repaint
--- reliably right after a window is created, which left windows blank until a
--- manual toggle forced a direct render.)
+-- schedule_render: synchronous, for the baseline / just-created-window path.
+-- (A deferred draw via DoAfterSpecial does not repaint reliably right after a
+-- window is created, which left windows blank until a manual toggle forced a
+-- direct render.)
 function schedule_render()
+   render_all()
+end
+
+-- schedule_live_render: debounced redraw for the live invmon/invitem stream. A
+-- burst (`put all.token bag`, emptying a keyring, etc.) fires one invmon per
+-- item; redrawing on each was the lag. Item state is still updated per-event
+-- (instantly) -- only the redraw is coalesced into one, ~0.25s after the burst
+-- starts (and at most once per 0.25s during a sustained stream). Windows already
+-- exist on this path, so the deferred-draw caveat above doesn't apply.
+local live_render_pending = false
+function schedule_live_render()
+   if live_render_pending then return end
+   live_render_pending = true
+   DoAfterSpecial(0.25, "Emon_live_render()", sendto.script)
+end
+
+function Emon_live_render()   -- global: DoAfterSpecial target
+   live_render_pending = false
    render_all()
 end
 
@@ -899,7 +918,7 @@ function emon_on_invmon(name, line, wildcards)
    else
       return
    end
-   schedule_render()
+   schedule_live_render()
 end
 
 -- {invitem}id,flags,name,...  (literal @-codes; full data for a genuine add)
@@ -907,7 +926,7 @@ function emon_on_invitem(name, line, wildcards)
    local _, _, w = invrex:match(wildcards[1])
    if w then
       store_item(make_record(w), "inv")
-      schedule_render()
+      schedule_live_render()
    end
 end
 
