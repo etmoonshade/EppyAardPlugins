@@ -38,7 +38,7 @@
    purpose="Live inventory display window for Aardwolf"
    date_written="2026-06-17 00:00:00"
    requires="5.07"
-   version="0.13"
+   version="0.14"
    save_state="y"
    sequence="100"
 >
@@ -220,7 +220,7 @@ local render_main, render_window_loc, render_monitor, render_monitor_missing, re
 local ensure_scope, toggle_scope
 local rebuild_container, emon_batch
 local schedule_render, schedule_reconcile, toggle_main, note, show_help
-local has_live_timer, schedule_timer_tick, schedule_live_render
+local schedule_timer_tick, schedule_live_render
 
 -- --------------------------------------------------------------------- --
 -- helpers
@@ -579,17 +579,30 @@ end
 -- --------------------------------------------------------------------- --
 -- rendering (reads from `items`; no commands)
 -- --------------------------------------------------------------------- --
+-- rebuild a window's body while preserving its scroll position. clear+re-add
+-- follows the bottom (TextRect lockstep), so without this any redraw jumps a
+-- scrolled window to the bottom -- and on the timer tick that showed as a flicker
+-- (draw-at-bottom, then restore). One draw at the kept position; the scrollbar
+-- re-syncs from start_line via the draw's update callbacks.
+local function repaint(win, build)
+   local scroll = win.textrect:getScroll()
+   win:clear(false)
+   build()
+   win.textrect:setScroll(scroll, true)   -- set start_line, no extra draw
+   win:draw()
+end
+
 -- render the items at a given loc into a window (used by main / keyring / vault)
 function render_window_loc(win, loc)
    if not win then return end
-   win:clear(false)
-   local stacks = sort_stacks(aggregate(collect(function(it) return it.loc == loc end)))
-   if #stacks == 0 then
-      win:add_text("@D(empty)", false)
-   else
-      render_stacks(win, stacks)
-   end
-   win:draw()
+   repaint(win, function()
+      local stacks = sort_stacks(aggregate(collect(function(it) return it.loc == loc end)))
+      if #stacks == 0 then
+         win:add_text("@D(empty)", false)
+      else
+         render_stacks(win, stacks)
+      end
+   end)
 end
 
 function render_main()
@@ -623,17 +636,17 @@ function render_monitor(mon)
    local total = 0
    for _, st in ipairs(stacks) do total = total + st.count end
 
-   win:clear(false)
-   local hdr = (cname or mon.term)
-   if #mon.filters > 0 then hdr = hdr .. " @D[@w" .. table.concat(mon.filters, ", ") .. "@D]" end
-   hdr = hdr .. " @W(" .. total .. ")@w"
-   win:add_text(hdr, false)
-   if #stacks == 0 then
-      win:add_text("@D(none)", false)
-   else
-      render_stacks(win, stacks)
-   end
-   win:draw()
+   repaint(win, function()
+      local hdr = (cname or mon.term)
+      if #mon.filters > 0 then hdr = hdr .. " @D[@w" .. table.concat(mon.filters, ", ") .. "@D]" end
+      hdr = hdr .. " @W(" .. total .. ")@w"
+      win:add_text(hdr, false)
+      if #stacks == 0 then
+         win:add_text("@D(none)", false)
+      else
+         render_stacks(win, stacks)
+      end
+   end)
 end
 
 function render_all()
@@ -863,9 +876,22 @@ end
 -- --------------------------------------------------------------------- --
 local timer_tick_scheduled = false
 
-function has_live_timer()
+-- is any item displayed at `loc` carrying a live expiry timer?
+local function loc_has_expiry(loc)
    for _, it in pairs(items) do
-      if it.expiry then return true end
+      if it.loc == loc and it.expiry then return true end
+   end
+   return false
+end
+
+-- same, for a monitor: a timed item in its container that passes the name filter
+local function mon_has_expiry(mon)
+   if not mon.cache_id then return false end
+   for _, it in pairs(items) do
+      if it.loc == mon.cache_id and it.expiry
+         and (#mon.filters == 0 or matches_any(it.plain, mon.filters)) then
+         return true
+      end
    end
    return false
 end
@@ -879,17 +905,16 @@ end
 function Emon_timer_tick()   -- global: DoAfterSpecial target
    timer_tick_scheduled = false
    if not in_game() then return end    -- loop stops on disconnect; go-live restarts it
-   if has_live_timer() then
-      -- a tick changes only the timer text, never the line count, so save each
-      -- window's scroll and restore it after the redraw -- otherwise a scrolled
-      -- keyring would snap back to the top every 30 seconds
-      local saved = {}
-      local function remember(w) if w then saved[#saved + 1] = { w, w.textrect:getScroll() } end end
-      remember(main_window)
-      for _, w in pairs(scope_win) do remember(w) end
-      for _, mon in pairs(monitors) do remember(mon.window) end
-      render_all()
-      for _, pair in ipairs(saved) do pair[1]:set_scroll(pair[2]) end
+   -- redraw ONLY windows that currently show a timed item, so a timer-less window
+   -- is never cleared/redrawn (no needless work, no flicker). render_* preserves
+   -- scroll, so no save/restore needed here.
+   if main_window and loc_has_expiry("inv") then render_main() end
+   for _, name in ipairs(SCOPE_ORDER) do
+      local w = scope_win[SCOPES[name].loc]
+      if w and loc_has_expiry(SCOPES[name].loc) then render_window_loc(w, SCOPES[name].loc) end
+   end
+   for _, mon in pairs(monitors) do
+      if mon.window and mon_has_expiry(mon) then render_monitor(mon) end
    end
    schedule_timer_tick()               -- keep ticking; timers may appear/refresh
 end
