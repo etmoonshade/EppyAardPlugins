@@ -38,7 +38,7 @@
    purpose="Live inventory display window for Aardwolf"
    date_written="2026-06-17 00:00:00"
    requires="5.07"
-   version="0.14"
+   version="0.15"
    save_state="y"
    sequence="100"
 >
@@ -1384,6 +1384,22 @@ end
 
 function OnPluginDisconnect()
    entered = false
+end
+
+-- Re-arm the in-game flag after a reconnect that never re-showed the welcome line
+-- (a link-recovery reconnect, or a disconnect/reconnect that skipped the login
+-- banner). A FRESH char.vitals/char.status GMCP broadcast proves we're actually
+-- in the game: those stream during play but NOT at the login screen (where GMCP
+-- is only stale-cached), so this can't misfire at the username prompt the way
+-- trusting the cached gmcp_playing() value there would. Without this, `entered`
+-- stuck false silently and every pull (refresh, monitor scan, timer tick) no-oped.
+function OnPluginBroadcast(msg, id, name, text)
+   if entered or not IsConnected() then return end
+   if id ~= "3e7dedbe37e44942dd46d264" then return end       -- Aardwolf GMCP handler
+   if (text == "char.vitals" or text == "char.status") and gmcp_playing() then
+      entered = true
+      schedule_golive()
+   end
 end
 
 function OnPluginInstall()
